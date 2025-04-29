@@ -1,54 +1,92 @@
-import configparser, os, torch
+#!/usr/bin/python3
+
+import sys
+import os
+import time
+import threading
+import pickle
 from threading import Event
-import agent
+import socket
+import torch
+from configparser import ConfigParser
 from replay_memory import ReplayMemory
-from ounoise import OUNoise
+from agent import Online_Agent, Offline_Agent
 from naf_lstm import NAF_LSTM
-from reles_env import Env
-import numpy as np
+from datetime import datetime
+import shutil
 
-# 1. 读取配置
-cfg = configparser.ConfigParser()
-cfg.read("config.ini")
+def main(argv):
+    cfg = ConfigParser()
+    cfg.read('config.ini')
 
-state_dim = cfg.getint("env", "k") * cfg.getint("env", "max_num_subflows") * 5
-action_dim = cfg.getint("env", "max_num_subflows")
+    # ✅ 修改这里以适配你的 testbed（server IP / port）
+    IP = "192.168.56.107"
+    PORT = 8888
 
-# 2. 初始化 socket 环境（连接到你 server 虚拟机）
-try:
-    env = Env(server_ip="192.168.56.107",
-              server_port=8888,
-              time_interval=cfg.getfloat("env", "time"),
-              alpha=cfg.getfloat("env", "alpha"))
-except Exception as e:
-    print(f"[ERROR] Socket connection to Server failed: {e}")
-    exit(1)
+    MEMORY_FILE = cfg.get('replaymemory','memory')
+    AGENT_FILE = cfg.get('nafcnn','agent')
+    INTERVAL = cfg.getint('train','interval')
+    EPISODE = cfg.getint('train','episode')
+    BATCH_SIZE = cfg.getint('train','batch_size')
+    MAX_NUM_FLOWS = cfg.getint("env",'max_num_subflows')
+    transfer_event = Event()
+    CONTINUE_TRAIN = 1
+    
+    if len(argv) != 0:
+        CONTINUE_TRAIN = int(argv[0])
+        now = datetime.now().replace(microsecond=0)
+        start_train = now.strftime("%Y-%m-%d %H:%M:%S")
+        scenario = argv[1]
 
-# 3. 初始化经验池和噪声
-memory = ReplayMemory(cfg.getint("replaymemory", "capacity"))
-noise = OUNoise(action_dim)
-event = Event()
-agent_file = cfg.get("nafcnn", "agent")
+    # ✅ memory 载入或新建
+    if os.path.exists(MEMORY_FILE) and CONTINUE_TRAIN:
+        with open(MEMORY_FILE,'rb') as f:
+            try:
+                memory = pickle.load(f)
+            except EOFError:
+                print("memory EOF error not saved properly")
+                memory = ReplayMemory(cfg.getint('replaymemory','capacity'))
+    else:
+        memory = ReplayMemory(cfg.getint('replaymemory','capacity'))
 
-# 4. 如果模型文件不存在则新建（源仓库逻辑）
-if not os.path.exists(agent_file):
-    print(f"[INFO] No model file found. Initializing new agent at '{agent_file}'")
-    model = NAF_LSTM(
-        gamma=cfg.getfloat("nafcnn", "gamma"),
-        tau=cfg.getfloat("nafcnn", "tau"),
-        hidden_size=cfg.getint("nafcnn", "hidden_size"),
-        num_inputs=state_dim,
-        action_space=action_dim
-    )
-    torch.save(model, agent_file)
-else:
-    print(f"[INFO] Using existing model '{agent_file}'")
+    # ✅ model 载入或初始化
+    if CONTINUE_TRAIN != 1 and os.path.exists(AGENT_FILE):
+        os.makedirs("trained_models/",exist_ok=True)
+        shutil.move(AGENT_FILE,"trained_models/agent"+start_train+".pkl")
+    if not os.path.exists(AGENT_FILE) or CONTINUE_TRAIN != 1:
+        agent = NAF_LSTM(
+            gamma=cfg.getfloat('nafcnn','gamma'),
+            tau=cfg.getfloat('nafcnn','tau'),
+            hidden_size=cfg.getint('nafcnn','hidden_size'),
+            num_inputs=cfg.getint('env','k') * MAX_NUM_FLOWS * 5,
+            action_space=MAX_NUM_FLOWS
+        )
+        torch.save(agent, AGENT_FILE)
 
-# 5. 启动强化学习线程（与 server.py 完全一致）
-offline_agent = agent.Offline_Agent(cfg, agent_file, memory, event)
-online_agent = agent.Online_Agent(env.fd, cfg, memory, event)
+    # ✅ 连接 socket，获得 fd
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((IP, PORT))
+    fd = sock.fileno()
 
-offline_agent.start()
-online_agent.start()
-offline_agent.join()
-online_agent.join()
+    # ✅ 启动 agent（完全照搬 server.py）
+    off_agent = Offline_Agent(cfg=cfg, model=AGENT_FILE, memory=memory, event=transfer_event)
+    off_agent.daemon = True
+    on_agent = Online_Agent(fd=fd, cfg=cfg, memory=memory, event=transfer_event)
+
+    off_agent.start()
+    on_agent.start()
+
+    try:
+        while(transfer_event.wait(timeout=60)):
+            if len(memory) > BATCH_SIZE and not off_agent.is_alive():
+                off_agent = Offline_Agent(cfg=cfg, model=AGENT_FILE, memory=memory, event=transfer_event)
+                off_agent.start()
+            time.sleep(25)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        with open(MEMORY_FILE,'wb') as f:
+            pickle.dump(memory, f)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
