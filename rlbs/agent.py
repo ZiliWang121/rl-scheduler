@@ -5,7 +5,7 @@ import os
 from naf_lstm import NAF_LSTM
 import mpsched
 from replay_memory import ReplayMemory, Transition
-from env import Env
+from reles_env import Env
 from ounoise import OUNoise
 import time
 import numpy as np
