@@ -17,8 +17,7 @@ env = Env(server_ip="192.168.56.107",
           time_interval=cfg.getfloat("env", "time"),
           alpha=cfg.getfloat("env", "alpha"))
 
-memory = ReplayMemory(cfg.getint("replaymemory", "capacity"),
-                      cfg.get("replaymemory", "memory"))
+memory = ReplayMemory(cfg.getint("replaymemory", "capacity"))
 noise = OUNoise(action_dim)
 
 offline_agent = agent.Offline_Agent(cfg, memory)
