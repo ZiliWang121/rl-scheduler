@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import os
 
-class MPTCPEnv:
+class Env:
     def __init__(self, state_file, perf_file, gamma=0.99):
         self.state_data = pd.read_csv(state_file)
         self.perf_data = pd.read_csv(perf_file)
