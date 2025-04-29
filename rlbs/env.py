@@ -1,77 +1,65 @@
-#!/usr/bin/env python3
-
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 import os
 
 class MPTCPEnv:
-    """
-    适配你Testbed环境的 MPTCP 环境封装。
-    读取 state_{scheduler}.csv 文件，用于训练。
-    """
+    def __init__(self, state_file, perf_file, gamma=0.99):
+        self.state_data = pd.read_csv(state_file)
+        self.perf_data = pd.read_csv(perf_file)
+        self.gamma = gamma
 
-    def __init__(self, scheduler="default"):
-        """
-        初始化
-        :param scheduler: 测试的 scheduler 名字
-        """
-        self.scheduler = scheduler
-        self.state_file = f"state_{scheduler}.csv"
-        self.metrics_file = f"metrics_{scheduler}.csv"
-
-        if not os.path.exists(self.state_file):
-            raise FileNotFoundError(f"{self.state_file} 不存在，请先运行数据采集脚本！")
-        if not os.path.exists(self.metrics_file):
-            raise FileNotFoundError(f"{self.metrics_file} 不存在，请先运行数据采集脚本！")
-
-        # 读取state和reward数据
-        self.states = pd.read_csv(self.state_file).values
-        self.metrics = pd.read_csv(self.metrics_file)
-
-        self.max_step = len(self.states)
+        self.num_subflows = self._get_num_subflows()
         self.current_step = 0
 
+        self.state_dim = 8 * self.num_subflows  # ⚡注意⚡ 这里改成了8，因为每个子流8个指标
+        self.action_dim = self.num_subflows
+
+        self.states = self._build_states()
+        self.rewards = self._build_rewards()
+
+    def _get_num_subflows(self):
+        # 从 state.csv 第一行推断子流数量
+        columns = list(self.state_data.columns)
+        # state默认每个子流有8项，且都是子流编号为0,1,2...
+        subflow_indices = set()
+        for col in columns:
+            if '_' in col:
+                idx = int(col.split('_')[0])
+                subflow_indices.add(idx)
+        return len(subflow_indices)
+
+    def _build_states(self):
+        # ⚡构建状态矩阵，每一行是一个时刻的所有子流的8项指标拼接
+        states = []
+        for _, row in self.state_data.iterrows():
+            state = []
+            for i in range(self.num_subflows):
+                for metric in ['cwnd', 'rtt', 'unacked', 'loss', 'data_segs_out', 'srtt', 'rcv_ooopack', 'snd_wnd']:
+                    state.append(row.get(f'{i}_{metric}', 0))
+            states.append(state)
+        return torch.FloatTensor(states)
+
+    def _build_rewards(self):
+        # ⚡从perf_data.csv直接拿reward：throughput - α * rtt - β * loss
+        rewards = []
+        alpha = 1.0
+        beta = 1.0
+        for _, row in self.perf_data.iterrows():
+            reward = row['throughput_mbps'] - alpha * row['latency_max'] - beta * row['segment_loss_rate_weighted']
+            rewards.append(reward)
+        return torch.FloatTensor(rewards)
+
     def reset(self):
-        """
-        重置环境，回到初始状态
-        """
         self.current_step = 0
         return self.states[self.current_step]
 
     def step(self, action):
-        """
-        执行动作，移动到下一个state
-        :param action: agent输出的动作（在这个简单离线训练里，其实不会影响state变化）
-        :return: next_state, reward, done
-        """
+        # 目前是offline训练，所以只是顺序走
+        reward = self.rewards[self.current_step]
         self.current_step += 1
-        done = self.current_step >= self.max_step
-
-        if done:
-            next_state = np.zeros_like(self.states[0])
-            reward = 0
-        else:
-            next_state = self.states[self.current_step]
-            # 根据 proposal 和 ReLeS 文章，reward = throughput - alpha * RTT - beta * loss
-            throughput = self.metrics.loc[self.current_step, 'throughput_mbps']
-            rtt = self.metrics.loc[self.current_step, 'latency_max']
-            loss = self.metrics.loc[self.current_step, 'segment_loss_rate_weighted']
-            # 这里 alpha=0.01, beta=0.1 可根据你 proposal 或实验需要调
-            reward = throughput - 0.01 * rtt - 0.1 * loss
-
-        return next_state, reward, done
-
-    def get_state_dim(self):
-        """
-        返回state的维度（用于初始化神经网络输入）
-        """
-        return self.states.shape[1]
-
-    def get_action_dim(self):
-        """
-        返回action维度（用于初始化神经网络输出）
-        假设一个动作对应每条子流一个比例
-        """
-        n_subflows = (self.states.shape[1] - 1) // 8
-        return n_subflows
+        done = self.current_step >= len(self.states)
+        next_state = None if done else self.states[self.current_step]
+        return next_state, reward, done, {}
 
