@@ -24,7 +24,9 @@ class Env:
         mpsched.set_seg([self.fd] + list(map(int, action)))
 
         try:
-            os.write(self.fd, b'x' * 1400)
+            for _ in range(100):  # 连续发送 5 个包
+               os.write(self.fd, b'x' * 1400)
+               time.sleep(0.01)  # 微小等待
         except Exception as e:
             print("[ERROR] os.write failed:", e)
 
