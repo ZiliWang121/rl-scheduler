@@ -14,26 +14,28 @@ class Env:
         self.last_state = None
 
     def reset(self):
-        # 与原 env.py 完全一致，返回初始状态
         subflows = mpsched.get_sub_info(self.fd)
-        return self._build_state(subflows)
+        state = self._build_state(subflows)
+        self.last_state = state
+        return state
 
     def step(self, action):
         mpsched.set_seg([self.fd] + [int(a) for a in action])
 
-        for _ in range(100):  # 向 server 发数据触发路径
-            try:
+        # 发一些实际数据，确保 MPTCP 传输激活
+        try:
+            for _ in range(100):
                 import os
                 os.write(self.fd, b'x' * 1400)
-            except Exception as e:
-                print("[ERROR] os.write failed:", e)
-                break
-            time.sleep(0.005)
+                time.sleep(0.005)
+        except Exception as e:
+            print("[ERROR] os.write failed:", e)
 
         time.sleep(self.time)
         subflows = mpsched.get_sub_info(self.fd)
         next_state = self._build_state(subflows)
 
+        # 计算 reward
         if self.last_state is None:
             reward = 0
         else:
@@ -42,17 +44,14 @@ class Env:
             reward = seg_diff + self.alpha * rtt_term
 
         self.last_state = next_state
-        return next_state, reward, False  # False 表示未结束
-
-    def update_fd(self, fd):
-        self.fd = fd
+        return next_state, reward, False
 
     def _build_state(self, subflows):
         state = []
         for s in subflows:
-            segs_out, rtt, cwnd, unacked, retrans, *_ = s
-            if rtt == 0: rtt = 1
-            state.append([segs_out, 1e6/rtt, cwnd, unacked, retrans])
-        state = np.array(state, dtype=np.float32)
-        self.last_state = state
-        return state
+            # 保留所有 8 个指标，确保与 agent.py 中访问位置一致
+            state.append([float(x) for x in s])
+        return np.array(state, dtype=np.float32)
+
+    def update_fd(self, fd):
+        self.fd = fd
