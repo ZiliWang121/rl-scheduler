@@ -12,44 +12,90 @@ class Env:
         self.b = b
         self.c = c
         self.max_flows = max_flows
-        self.last_state = None
+        self.tp = [[] for _ in range(self.max_flows)]
+        self.rtt = [[] for _ in range(self.max_flows)]
+        self.cwnd = [[] for _ in range(self.max_flows)]
+        self.rr = [[] for _ in range(self.max_flows)]
+        self.in_flight = [[] for _ in range(self.max_flows)]
+        self.last = None
 
     def reset(self):
-        # 初始状态，用于 episode 开始
-        state = mpsched.get_sub_info(self.fd)
-        self.last_state = np.array(state, dtype=np.float32)
-        return state
+        self.last = mpsched.get_sub_info(self.fd)
+        for _ in range(self.k):
+            subs = mpsched.get_sub_info(self.fd)
+
+            for j in range(self.max_flows):
+                if len(self.tp[j]) == self.k:
+                    self.tp[j].pop(0)
+                    self.rtt[j].pop(0)
+                    self.cwnd[j].pop(0)
+                    self.rr[j].pop(0)
+                    self.in_flight[j].pop(0)
+
+                if len(self.last) < self.max_flows:
+                    for _ in range(self.max_flows - len(self.last)):
+                        self.last.append([0, 0, 0, 0, 0])
+                if len(subs) < self.max_flows:
+                    for _ in range(self.max_flows - len(subs)):
+                        subs.append([0, 0, 0, 0, 0])
+
+                self.tp[j].append(np.abs(subs[j][0] - self.last[j][0]) * 1.44)
+                self.rtt[j].append(subs[j][1] / 1000)
+                self.cwnd[j].append((subs[j][2] + self.last[j][2]) / 2)
+                self.rr[j].append(np.abs(subs[j][3] - self.last[j][3]))
+                self.in_flight[j].append(np.abs(subs[j][4] - self.last[j][4]))
+
+            self.last = subs
+            time.sleep(self.time / 10)
+
+        return [self.tp[0], self.tp[1], self.rtt[0], self.rtt[1],
+                self.cwnd[0], self.cwnd[1], self.rr[0], self.rr[1],
+                self.in_flight[0], self.in_flight[1]]
 
     def step(self, action):
         mpsched.set_seg([self.fd] + list(map(int, action)))
-
         try:
-            for _ in range(100):  # 连续发送 5 个包
-               os.write(self.fd, b'x' * 1400)
-               time.sleep(0.01)  # 微小等待
+            for _ in range(100):
+                os.write(self.fd, b'x' * 1400)
+                time.sleep(0.01)
         except Exception as e:
             print("[ERROR] os.write failed:", e)
 
         time.sleep(self.time)
 
-        subflows = mpsched.get_sub_info(self.fd)
-        next_state = []
-        for s in subflows:
-            segs_out, rtt, cwnd, unacked, retrans, *_ = s
-            if rtt == 0:
-                rtt = 1
-            next_state.append([segs_out, 1e6 / rtt, cwnd, unacked, retrans])
-        next_state = np.array(next_state, dtype=np.float32)
+        subs = mpsched.get_sub_info(self.fd)
+        for j in range(self.max_flows):
+            if len(self.tp[j]) == self.k:
+                self.tp[j].pop(0)
+                self.rtt[j].pop(0)
+                self.cwnd[j].pop(0)
+                self.rr[j].pop(0)
+                self.in_flight[j].pop(0)
 
-        if self.last_state is None:
-            reward = 0
-        else:
-            seg_diff = (next_state[:, 0] - self.last_state[:, 0]).sum()
-            rtt_term = next_state[:, 1].sum()
-            reward = seg_diff + self.alpha * rtt_term
+            if len(self.last) < self.max_flows:
+                for _ in range(self.max_flows - len(self.last)):
+                    self.last.append([0, 0, 0, 0, 0])
+            if len(subs) < self.max_flows:
+                for _ in range(self.max_flows - len(subs)):
+                    subs.append([0, 0, 0, 0, 0])
 
-        self.last_state = next_state
-        return next_state, reward, False  # 最后一项用于 done 判断
+            self.tp[j].append(np.abs(subs[j][0] - self.last[j][0]) * 1.44)
+            self.rtt[j].append(subs[j][1] / 1000)
+            self.cwnd[j].append((subs[j][2] + self.last[j][2]) / 2)
+            self.rr[j].append(np.abs(subs[j][3] - self.last[j][3]))
+            self.in_flight[j].append(np.abs(subs[j][4] - self.last[j][4]))
+
+        self.last = subs
+
+        reward = (self.tp[0][-1] + self.tp[1][-1])
+        if reward != 0:
+            reward -= (1 / reward) * self.alpha * (
+                self.rtt[0][-1] * self.tp[0][-1] + self.rtt[1][-1] * self.tp[1][-1])
+        reward -= self.b * (self.in_flight[0][-1] + self.in_flight[1][-1])
+
+        return [self.tp[0], self.tp[1], self.rtt[0], self.rtt[1],
+                self.cwnd[0], self.cwnd[1], self.rr[0], self.rr[1],
+                self.in_flight[0], self.in_flight[1]], reward, False
 
     def update_fd(self, fd):
         self.fd = fd
