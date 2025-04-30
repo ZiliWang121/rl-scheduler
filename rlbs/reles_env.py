@@ -19,7 +19,9 @@ class Env:
         return state
 
     def step(self, action):
-        mpsched.set_seg([self.fd] + [int(a) for a in action])
+        # ✅ 修复：将 tensor 结构转换为 Python list 后再 int()
+        action_list = [int(a) for a in action.detach().cpu().numpy().flatten()]
+        mpsched.set_seg([self.fd] + action_list)
 
         try:
             for _ in range(100):
