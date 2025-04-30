@@ -60,6 +60,9 @@ def main(argv):
     off_agent = Offline_Agent(cfg=cfg, model=AGENT_FILE, memory=memory, event=transfer_event)
     on_agent = Online_Agent(fd=fd, cfg=cfg, memory=memory, event=transfer_event)
 
+    # ✅ 加这一句，立即触发 episode 开始（因为没有 server.py 自动 set）
+    transfer_event.set()
+
     off_agent.daemon = True
     off_agent.start()
     on_agent.start()
