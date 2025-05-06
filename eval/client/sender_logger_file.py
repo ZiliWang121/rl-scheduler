@@ -1,48 +1,63 @@
 #!/usr/bin/env python3
 """
-UE 端脚本：将文件分块上传至 Server，并在每块数据前附加发送时间戳。
-适用于 MPTCP 测试。
+UE 发送端脚本（配合文件下载场景）：
+- 将一个文件读取为多个 1024 字节块
+- 每块前 8 字节为发送时的时间戳（float64）
+- 后续填充为文件内容（不足填 x）
+- 每发一块 sleep INTERVAL 控制速率（可设为 0）
 """
 
 import socket
 import struct
 import time
-import argparse
 import os
 
-# ---------------- 参数配置 ----------------
-parser = argparse.ArgumentParser()
-parser.add_argument('--file', type=str, required=True, help='要发送的文件路径')
-parser.add_argument('--server-ip', type=str, required=True, help='服务器 IP')
-parser.add_argument('--port', type=int, default=8888, help='服务器端口')
-parser.add_argument('--chunk-size', type=int, default=1024, help='每块数据大小（字节）')
-args = parser.parse_args()
+# ------------------- 配置区域 -------------------
+SERVER_IP = "192.168.56.107"     # 接收端 Server 的 IP 地址（你的 server VM）
+SERVER_PORT = 8888               # Server 的监听端口
+FILE_PATH = "testfiles/64MB.file"  # 要发送的文件路径（可修改）
+CHUNK_SIZE = 1024                # 每块大小
+INTERVAL = 0                     # 两块之间等待时间（单位：秒）
+# ------------------------------------------------
 
-file_path = args.file
-server_ip = args.server_ip
-port = args.port
-chunk_size = args.chunk_size
-assert chunk_size > 8, "块大小必须大于 8 字节（用于时间戳）"
+def main():
+    # 检查文件是否存在
+    if not os.path.exists(FILE_PATH):
+        print(f"[Error] File not found: {FILE_PATH}")
+        return
 
-# ---------------------------------------
+    # 创建 TCP socket 并连接 Server
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((SERVER_IP, SERVER_PORT))
+    print(f"[Client] Connected to {SERVER_IP}:{SERVER_PORT}")
 
-# 打开文件并连接 Server
-file_size = os.path.getsize(file_path)
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect((server_ip, port))
-print(f"[Client] Connected to {server_ip}:{port}, sending {file_path} ({file_size} bytes)...")
+    with open(FILE_PATH, "rb") as f:
+        chunk_num = 0
+        while True:
+            payload = f.read(CHUNK_SIZE - 8)  # 留出8字节存时间戳
+            if not payload:
+                break  # 文件读取完毕
 
-with open(file_path, "rb") as f:
-    sent_bytes = 0
-    while True:
-        data = f.read(chunk_size - 8)  # 每块前面预留8字节时间戳
-        if not data:
-            break
-        ts = time.time()
-        chunk = struct.pack("!d", ts) + data  # 加入时间戳（float64, 8字节）
-        sock.sendall(chunk)
-        sent_bytes += len(data)
-        print(f"[Client] Sent {sent_bytes}/{file_size} bytes", end="\r")
+            # 获取当前时间戳（float64，单位秒）
+            send_ts = time.time()
+            ts_bytes = struct.pack("!d", send_ts)
 
-sock.close()
-print(f"\n[Client] Upload complete.")
+            # 如果 payload 不足，补充 x 填满
+            if len(payload) < CHUNK_SIZE - 8:
+                payload += b'x' * (CHUNK_SIZE - 8 - len(payload))
+
+            # 构造完整的数据块（时间戳 + 文件块）
+            data_block = ts_bytes + payload
+            sock.sendall(data_block)
+
+            chunk_num += 1
+            print(f"[Send] Chunk #{chunk_num}")
+
+            if INTERVAL > 0:
+                time.sleep(INTERVAL)
+
+    sock.close()
+    print("[Client] All chunks sent.")
+
+if __name__ == "__main__":
+    main()
