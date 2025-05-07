@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 UE 发送端脚本（多文件、多轮发送）：
-- 每个文件发送 N_ROUNDS 次
+- 每个文件发送 N_ROUNDS 次（可通过命令行参数指定）
 - 每块 1024 字节，前 8 字节为发送时间戳（float64）
 - 每轮之间 sleep 控制节奏
 """
@@ -10,20 +10,32 @@ import socket
 import struct
 import time
 import os
+import sys  # ← 新增：用于接收命令行参数
 
 # ------------------- 配置区域 -------------------
-SERVER_IP = "192.168.56.107"     # Server 的 IP 地址
-SERVER_PORT = 8888               # Server 监听端口
-CHUNK_SIZE = 1024                # 每块大小，前8字节为时间戳
-INTERVAL = 0                     # 每块间隔发送时间（秒）
-N_ROUNDS = 3                     # 每个文件测试轮数
-FILE_LIST = [                    # 要发送的文件列表
+SERVER_IP = "192.168.56.107"
+SERVER_PORT = 8888
+CHUNK_SIZE = 1024
+INTERVAL = 0
+
+# 默认轮数（可被命令行参数覆盖）
+N_ROUNDS = 3
+
+FILE_LIST = [
     "testfiles/64KB.file",
     "testfiles/256KB.file",
     "testfiles/8MB.file",
     "testfiles/64MB.file"
 ]
 # ------------------------------------------------
+
+# 新增：通过命令行参数修改 N_ROUNDS
+if len(sys.argv) >= 2:
+    try:
+        N_ROUNDS = int(sys.argv[1])
+        print(f"[Config] Using N_ROUNDS = {N_ROUNDS} from argument")
+    except ValueError:
+        print("[Warning] Invalid round number argument. Using default.")
 
 def send_file(file_path):
     with open(file_path, "rb") as f:
@@ -41,6 +53,13 @@ def send_file(file_path):
                 time.sleep(INTERVAL)
     return chunk_num
 
+# ⚠️ 新增：首次连接，发送 4 字节的 N_ROUNDS 给 server
+first_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+first_conn.connect((SERVER_IP, SERVER_PORT))
+first_conn.sendall(struct.pack("!I", N_ROUNDS))  # 网络字节序整数
+first_conn.close()
+time.sleep(20)
+
 for file_path in FILE_LIST:
     if not os.path.exists(file_path):
         print(f"[Error] File not found: {file_path}")
@@ -53,4 +72,4 @@ for file_path in FILE_LIST:
         num_chunks = send_file(file_path)
         sock.close()
         print(f"[Client] Sent {num_chunks} chunks.")
-        time.sleep(1)  # 每轮间隔 1 秒
+        time.sleep(20)
