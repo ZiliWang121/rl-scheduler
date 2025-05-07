@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Server 接收端脚本（文件分组统计）：
-- 每次连接接收完整一个文件（chunk流）
-- 按文件名分组，记录每轮指标（delay / goodput / time）
-- 所有轮次结束后输出每个文件的平均性能指标到 summary.csv
+Server 接收端脚本（调度器 + 文件 + 多轮统计）：
+- 第一次连接接收 N_ROUNDS（4 字节）
+- 后续按 [调度器 × 文件 × 轮次] 顺序接收 chunk 流
+- 每轮记录 delay / goodput / time，最终输出 summary.csv
 """
 
 import socket
@@ -16,15 +16,14 @@ from collections import defaultdict
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 8888
 CHUNK_SIZE = 1024
-N_ROUNDS_PER_FILE = 3
+
+# 与 client 保持一致顺序
+SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest", "ecf", "reles", "falcon"]
 FILE_LIST = ["64KB.file", "256KB.file", "8MB.file", "64MB.file"]
+
 CSV_LOG = "recv_log.csv"
 CSV_SUMMARY = "summary.csv"
 # ------------------------------------------------
-
-# 每个连接都按顺序推断属于哪个文件第几轮
-expected_files = [(fname, i + 1) for fname in FILE_LIST for i in range(N_ROUNDS_PER_FILE)]
-file_metrics = defaultdict(list)  # fname -> list of dicts with keys: delay, goodput, time
 
 def recv_exact(sock, size):
     buf = b''
@@ -35,20 +34,39 @@ def recv_exact(sock, size):
         buf += chunk
     return buf
 
-# 监听 socket
+# 初始化 socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((LISTEN_IP, LISTEN_PORT))
 sock.listen(5)
-
 print(f"[Server] Listening on {LISTEN_IP}:{LISTEN_PORT}")
+
+# ⚠️ 第一次连接用于接收 N_ROUNDS（4 字节）
+print("[Server] Waiting for round count...")
+conn, addr = sock.accept()
+n_rounds_bytes = recv_exact(conn, 4)
+N_ROUNDS = struct.unpack("!I", n_rounds_bytes)[0]
+conn.close()
+print(f"[Server] Received N_ROUNDS = {N_ROUNDS}")
+
+# 构建任务顺序：Scheduler × File × Round
+expected_tasks = []
+for sched in SCHEDULER_LIST:
+    for fname in FILE_LIST:
+        for round_id in range(1, N_ROUNDS + 1):
+            expected_tasks.append((sched, fname, round_id))
+
+# 初始化数据结构
+file_metrics = defaultdict(list)  # key = (sched, fname)
+
+# 初始化日志
 csvfile = open(CSV_LOG, "w", newline='')
 csvwriter = csv.writer(csvfile)
-csvwriter.writerow(["File", "Round", "NumChunks", "AvgDelay(ms)", "Goodput(KB/s)", "DownloadTime(s)"])
+csvwriter.writerow(["Scheduler", "File", "Round", "NumChunks", "AvgDelay(ms)", "Goodput(KB/s)", "DownloadTime(s)"])
 
-# 主循环
-for file_index, (fname, round_id) in enumerate(expected_files, 1):
-    print(f"\n[Server] Waiting for: {fname}, round {round_id}")
+# 接收循环
+for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
+    print(f"\n[Server] Waiting for: Scheduler={sched}, File={fname}, Round={round_id}")
     conn, addr = sock.accept()
     print(f"[Server] Connection from {addr}")
 
@@ -81,31 +99,33 @@ for file_index, (fname, round_id) in enumerate(expected_files, 1):
     avg_delay = delay_sum / chunk_count if chunk_count > 0 else 0
     goodput = (recv_bytes / 1024) / duration if duration > 0 else 0
 
-    # 写入逐轮日志
-    csvwriter.writerow([fname, round_id, chunk_count, avg_delay, goodput, duration])
-    file_metrics[fname].append({
+    csvwriter.writerow([sched, fname, round_id, chunk_count, avg_delay, goodput, duration])
+    file_metrics[(sched, fname)].append({
         "chunks": chunk_count,
         "delay": avg_delay,
         "goodput": goodput,
         "time": duration,
     })
 
-    print(f"[Result] {fname} (Round {round_id}): Delay = {avg_delay:.2f} ms | "
+    print(f"[Result] {sched} | {fname} (Round {round_id}): Delay = {avg_delay:.2f} ms | "
           f"Goodput = {goodput:.2f} KB/s | Time = {duration:.2f} s")
 
 csvfile.close()
 sock.close()
 
-# 写入 summary.csv：每个文件一行
+# 写入 summary.csv（调度器 × 文件）
 with open(CSV_SUMMARY, "w", newline='') as summary:
     writer = csv.writer(summary)
-    writer.writerow(["File", "AvgChunks", "AvgDelay(ms)", "AvgGoodput(KB/s)", "AvgDownloadTime(s)"])
-    for fname in FILE_LIST:
-        metrics = file_metrics[fname]
-        avg_chunks = sum(m["chunks"] for m in metrics) / len(metrics)
-        avg_delay = sum(m["delay"] for m in metrics) / len(metrics)
-        avg_goodput = sum(m["goodput"] for m in metrics) / len(metrics)
-        avg_time = sum(m["time"] for m in metrics) / len(metrics)
-        writer.writerow([fname, avg_chunks, avg_delay, avg_goodput, avg_time])
+    writer.writerow(["Scheduler", "File", "AvgChunks", "AvgDelay(ms)", "AvgGoodput(KB/s)", "AvgDownloadTime(s)"])
+    for sched in SCHEDULER_LIST:
+        for fname in FILE_LIST:
+            metrics = file_metrics[(sched, fname)]
+            if not metrics:
+                continue
+            avg_chunks = sum(m["chunks"] for m in metrics) / len(metrics)
+            avg_delay = sum(m["delay"] for m in metrics) / len(metrics)
+            avg_goodput = sum(m["goodput"] for m in metrics) / len(metrics)
+            avg_time = sum(m["time"] for m in metrics) / len(metrics)
+            writer.writerow([sched, fname, avg_chunks, avg_delay, avg_goodput, avg_time])
 
 print("\n=== Summary written to summary.csv ===")
