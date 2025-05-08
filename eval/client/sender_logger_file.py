@@ -56,10 +56,12 @@ def send_file(file_path, sock):
                 time.sleep(INTERVAL)
     return chunk_num
 
-first_conn = connect_retry()
-first_conn.sendall(struct.pack("!I", N_ROUNDS))
-first_conn.close()
-time.sleep(20)
+# ✅【新增】只在环境变量 SEND_ROUND_FLAG=true 时发送轮数
+if os.environ.get("SEND_ROUND_FLAG", "true").lower() == "true":
+    first_conn = connect_retry()
+    first_conn.sendall(struct.pack("!I", N_ROUNDS))
+    first_conn.close()
+    time.sleep(30)
 
 for file_path in FILE_LIST:
     if not os.path.exists(file_path):
@@ -76,4 +78,4 @@ for file_path in FILE_LIST:
             print(f"[Error] 发送失败: {file_path} (Round {round_id})")
         else:
             print(f"[Client] Sent {num_chunks} chunks.")
-        time.sleep(20)
+        time.sleep(30)
