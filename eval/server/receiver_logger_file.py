@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Server 接收端脚本（支持断点续测追加 log）：
-- 接收 N_ROUNDS（轮数）
-- 接收 Scheduler × File × Round 数据
-- 追加写入 recv_log.csv，不覆盖旧记录
-- 自动偏移 round 编号继续记录
+Server 接收端脚本（支持断点续测 + 每调度器单独续轮）：
+- 从 client 接收 N_ROUNDS
+- 每次测量数据追加写入 recv_log.csv（而非覆盖）
+- 每个 Scheduler × File 对分别从已有最大轮次开始继续编号
 """
 
 import socket
@@ -13,7 +12,7 @@ import time
 import csv
 from collections import defaultdict
 
-# 配置区域
+# ------------------- 配置区域 -------------------
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 8888
 CHUNK_SIZE = 1024
@@ -21,9 +20,10 @@ SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest", "ecf"]
 FILE_LIST = ["8MB.file", "256MB.file"]
 CSV_LOG = "recv_log.csv"
 CSV_SUMMARY = "summary.csv"
+# ------------------------------------------------
 
-# 用于接收完整固定长度数据
 def recv_exact(sock, size):
+    """接收固定长度数据，如果连接正常关闭则返回 None"""
     buf = b''
     while len(buf) < size:
         try:
@@ -42,7 +42,7 @@ sock.bind((LISTEN_IP, LISTEN_PORT))
 sock.listen(5)
 print(f"[Server] Listening on {LISTEN_IP}:{LISTEN_PORT}")
 
-# 第一次连接：接收本次轮数
+# 第一次连接用于接收 N_ROUNDS
 print("[Server] Waiting for round count...")
 conn, addr = sock.accept()
 n_rounds_bytes = recv_exact(conn, 4)
@@ -50,20 +50,32 @@ N_ROUNDS = struct.unpack("!I", n_rounds_bytes)[0]
 conn.close()
 print(f"[Server] Received N_ROUNDS = {N_ROUNDS}")
 
-# ✅ 新增：读取已有 recv_log.csv，自动计算已有最大轮号
+# ✅ 读取已有 CSV_LOG 中的最大轮次数（每调度器 × 文件对分开记录）
+round_offset = defaultdict(int)
 try:
     with open(CSV_LOG, "r") as f:
         reader = csv.DictReader(f)
-        max_existing_round = max((int(row["Round"]) for row in reader if row["Round"].isdigit()), default=0)
+        for row in reader:
+            key = (row["Scheduler"], row["File"])
+            if row["Round"].isdigit():
+                round_offset[key] = max(round_offset[key], int(row["Round"]))
+    print(f"[Server] Detected round offset per key: {dict(round_offset)}")
 except FileNotFoundError:
-    max_existing_round = 0
-print(f"[Server] Detected max existing round = {max_existing_round}")
+    print("[Server] No previous log found, starting fresh.")
 
-# 构建任务列表
-expected_tasks = [(s, f, r) for s in SCHEDULER_LIST for f in FILE_LIST for r in range(1, N_ROUNDS + 1)]
+# ✅ 构建任务清单（每个 scheduler × file × round）
+expected_tasks = []
+for sched in SCHEDULER_LIST:
+    for fname in FILE_LIST:
+        base = round_offset.get((sched, fname), 0)
+        for i in range(N_ROUNDS):
+            round_id = base + i + 1  # 每个组合单独编号
+            expected_tasks.append((sched, fname, round_id))
+
+# 初始化 file_metrics 存储每轮结果
 file_metrics = defaultdict(list)
 
-# ✅ 改为追加写入，不清空旧日志
+# ✅ 打开 CSV_LOG 并追加写入，保留旧内容
 file_exists = False
 try:
     with open(CSV_LOG, "r"):
@@ -76,10 +88,9 @@ csvwriter = csv.writer(csvfile)
 if not file_exists:
     csvwriter.writerow(["Scheduler", "File", "Round", "NumChunks", "AvgDelay(ms)", "Goodput(KB/s)", "DownloadTime(s)"])
 
-# 遍历任务
+# 主循环接收每组测试数据
 for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
-    actual_round = max_existing_round + task_index  # ✅ 自动编号偏移
-    print(f"\n[Server] Waiting for: Scheduler={sched}, File={fname}, Round={actual_round}")
+    print(f"\n[Server] Waiting for: Scheduler={sched}, File={fname}, Round={round_id}")
     conn, addr = sock.accept()
     print(f"[Server] Connection from {addr}")
     conn.settimeout(10)
@@ -118,9 +129,9 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     goodput = (recv_bytes / 1024) / duration if duration > 0 else 0
 
     if chunk_count == 0:
-        print(f"[Error] No data received: {sched}-{fname} Round {actual_round}")
+        print(f"[Error] No data received: {sched}-{fname} Round {round_id}")
 
-    csvwriter.writerow([sched, fname, actual_round, chunk_count, avg_delay, goodput, duration])
+    csvwriter.writerow([sched, fname, round_id, chunk_count, avg_delay, goodput, duration])
     file_metrics[(sched, fname)].append({
         "chunks": chunk_count,
         "delay": avg_delay,
@@ -128,13 +139,13 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
         "time": duration,
     })
 
-    print(f"[Result] {sched} | {fname} (Round {actual_round}): Delay = {avg_delay:.2f} ms | "
+    print(f"[Result] {sched} | {fname} (Round {round_id}): Delay = {avg_delay:.2f} ms | "
           f"Goodput = {goodput:.2f} KB/s | Time = {duration:.2f} s")
 
 csvfile.close()
 sock.close()
 
-# Summary 仍然覆盖生成
+# ✅ Summary.csv 总结本轮（仍然是覆盖）
 with open(CSV_SUMMARY, "w", newline='') as summary:
     writer = csv.writer(summary)
     writer.writerow(["Scheduler", "File", "AvgChunks", "AvgDelay(ms)", "AvgGoodput(KB/s)", "AvgDownloadTime(s)"])
