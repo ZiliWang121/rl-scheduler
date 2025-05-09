@@ -9,31 +9,34 @@ LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 8888
 CHUNK_SIZE = 1024
 
-#SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest", "ecf", "reles", "falcon"]
 SCHEDULER_LIST = ["default", "roundrobin", "redundant", "blest", "ecf"]
-FILE_LIST = ["64KB.file", "256KB.file", "8MB.file", "64MB.file"]
+#FILE_LIST = ["64KB.file", "256KB.file", "8MB.file", "64MB.file"]
+FILE_LIST = ["8MB.file", "256MB.file"]
 
 CSV_LOG = "recv_log.csv"
 CSV_SUMMARY = "summary.csv"
 
+# ✅ Modified: no longer raise exception on normal socket close
 def recv_exact(sock, size):
     buf = b''
     while len(buf) < size:
         try:
             chunk = sock.recv(size - len(buf))
             if not chunk:
-                raise ConnectionError("连接断开，提前结束")
+                return None  # ✅ Return None to indicate normal connection close
             buf += chunk
         except socket.timeout:
-            raise TimeoutError("接收超时")
+            raise TimeoutError("Receive timeout")
     return buf
 
+# Create and bind TCP socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((LISTEN_IP, LISTEN_PORT))
 sock.listen(5)
 print(f"[Server] Listening on {LISTEN_IP}:{LISTEN_PORT}")
 
+# Receive the number of test rounds from client
 print("[Server] Waiting for round count...")
 conn, addr = sock.accept()
 n_rounds_bytes = recv_exact(conn, 4)
@@ -41,18 +44,21 @@ N_ROUNDS = struct.unpack("!I", n_rounds_bytes)[0]
 conn.close()
 print(f"[Server] Received N_ROUNDS = {N_ROUNDS}")
 
+# Build expected task list
 expected_tasks = [(s, f, r) for s in SCHEDULER_LIST for f in FILE_LIST for r in range(1, N_ROUNDS + 1)]
 file_metrics = defaultdict(list)
 
+# Open CSV log for writing
 csvfile = open(CSV_LOG, "w", newline='')
 csvwriter = csv.writer(csvfile)
 csvwriter.writerow(["Scheduler", "File", "Round", "NumChunks", "AvgDelay(ms)", "Goodput(KB/s)", "DownloadTime(s)"])
 
+# Loop through all expected transfers
 for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     print(f"\n[Server] Waiting for: Scheduler={sched}, File={fname}, Round={round_id}")
     conn, addr = sock.accept()
     print(f"[Server] Connection from {addr}")
-    conn.settimeout(10)  # ✅ 新增：防止阻塞在某个阶段卡死
+    conn.settimeout(10)  # prevent hanging forever
 
     recv_bytes = 0
     delay_sum = 0
@@ -63,14 +69,17 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
         while True:
             try:
                 data = recv_exact(conn, CHUNK_SIZE)
-            except (ConnectionError, TimeoutError) as e:
-                print(f"[Warning] 连接结束: {e}")
+                if data is None:
+                    print("[Info] Connection closed by client.")  # ✅ New message for normal closure
+                    break
+            except TimeoutError as e:
+                print(f"[Warning] Receive timeout: {e}")
                 break
             recv_time = time.time()
             try:
                 send_ts = struct.unpack("!d", data[:8])[0]
             except Exception as e:
-                print(f"[Error] 无法解析时间戳: {e}")
+                print(f"[Error] Failed to parse timestamp: {e}")
                 continue
             delay_ms = (recv_time - send_ts) * 1000
             delay_sum += delay_ms
@@ -85,7 +94,7 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     goodput = (recv_bytes / 1024) / duration if duration > 0 else 0
 
     if chunk_count == 0:
-        print(f"[Error] 未收到数据: {sched}-{fname} Round {round_id}")
+        print(f"[Error] No data received: {sched}-{fname} Round {round_id}")
 
     csvwriter.writerow([sched, fname, round_id, chunk_count, avg_delay, goodput, duration])
     file_metrics[(sched, fname)].append({
@@ -98,6 +107,7 @@ for task_index, (sched, fname, round_id) in enumerate(expected_tasks, 1):
     print(f"[Result] {sched} | {fname} (Round {round_id}): Delay = {avg_delay:.2f} ms | "
           f"Goodput = {goodput:.2f} KB/s | Time = {duration:.2f} s")
 
+# Write final summary CSV
 csvfile.close()
 sock.close()
 
